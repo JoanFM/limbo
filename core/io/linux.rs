@@ -2,8 +2,8 @@ use super::{Completion, File, WriteCompletion, IO};
 use anyhow::{ensure, Result};
 use libc::iovec;
 use log::{debug, trace};
-use std::cell::{Ref, RefCell};
-use nix::fcntl::{self, FcntlArg, OFlag};
+use std::cell::RefCell;
+use nix::fcntl::{FcntlArg, OFlag};
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use std::fmt;
@@ -32,7 +32,7 @@ pub struct LinuxIO {
 pub struct InnerLinuxIO {
     ring: io_uring::IoUring,
     iovecs: [iovec; MAX_IOVECS],
-    next_iovec: usize,
+    free_io_vec_idx: [u8; MAX_IOVECS/8], //bitmap to keep track of the iovecs that are available for a SQ to take.
 }
 
 impl LinuxIO {
@@ -44,7 +44,7 @@ impl LinuxIO {
                 iov_base: std::ptr::null_mut(),
                 iov_len: 0,
             }; MAX_IOVECS],
-            next_iovec: 0,
+            free_io_vec_idx: [0; MAX_IOVECS / 8],
         };
         Ok(Self {
             inner: Rc::new(RefCell::new(inner)),
@@ -52,13 +52,62 @@ impl LinuxIO {
     }
 }
 
+// Define a custom error type
+#[derive(Debug)]
+struct ExhaustedIOVecError(String);
+
+impl fmt::Display for ExhaustedIOVecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ExhaustedIOVecError Error")
+    }
+}
+
+
+struct ReadCompletionWrapped {
+    // I expect that the pointer to CompletionWrapped also points to Completion so that IOUring can read/write into/from the buffer
+    completion: Rc<Completion>,
+    io_vec_idx: usize, 
+}
+
+struct WriteCompletionWrapped {
+    // I expect that the pointer to CompletionWrapped also points to Completion so that IOUring can read/write into/from the buffer
+    completion: Rc<WriteCompletion>,
+    io_vec_idx: usize, 
+}
 impl InnerLinuxIO {
-    pub fn get_iovec<'a>(&'a mut self, buf: *const u8, len: usize) -> &'a iovec {
-        let iovec = &mut self.iovecs[self.next_iovec];
+    fn get_next_free_iovec_slot(&self) -> Result<usize, ExhaustedIOVecError> {
+        let mut free_idx = 0;
+        while free_idx != MAX_IOVECS { // if it has gone through all candidates it should fail
+            let byte_index = (free_idx % MAX_IOVECS) / 8;
+            let bit_index = (free_idx % MAX_IOVECS) % 8;
+            if (self.free_io_vec_idx[byte_index] & (1 << bit_index)) == 0 {
+                return Ok(free_idx);
+            }
+            free_idx += 1;
+        }
+        return Err(ExhaustedIOVecError("Unable to find a free iovec slot for IOUring to use".to_string()));
+    }
+
+    pub fn set_io_vec_in_use(&mut self, idx: usize) {
+        let byte_index = idx / 8;
+        let bit_index = idx % 8;
+        self.free_io_vec_idx[byte_index] |= 1 << bit_index;
+    }
+
+    pub fn free_io_vec_in_use(&mut self, idx: usize) {
+        let byte_index = idx / 8;
+        let bit_index = idx % 8;
+        self.free_io_vec_idx[byte_index] &= !(1 << bit_index);
+    }
+
+    pub fn get_iovec<'a>(&'a mut self, buf: *const u8, len: usize) -> (&'a iovec, usize) {
+        //TODO: Handle error in a good way
+        let free_idx = self.get_next_free_iovec_slot().unwrap();
+        self.set_io_vec_in_use(free_idx);
+        let iovec = &mut self.iovecs[free_idx];
         iovec.iov_base = buf as *mut std::ffi::c_void;
         iovec.iov_len = len;
-        self.next_iovec = (self.next_iovec + 1) % MAX_IOVECS;
-        iovec
+        (iovec, free_idx)
     }
 }
 
@@ -85,17 +134,31 @@ impl IO for LinuxIO {
     fn run_once(&self) -> Result<()> {
         trace!("run_once()");
         let mut inner = self.inner.borrow_mut();
-        let mut ring = &mut inner.ring;
-        ring.submit_and_wait(1)?;
-        while let Some(cqe) = ring.completion().next() {
-            let result = cqe.result();
-            ensure!(
-                result >= 0,
-                LinuxIOError::IOUringCQError(result)
-            );
-            let c = unsafe { Rc::from_raw(cqe.user_data() as *const Completion) };
-            c.complete();
+        let mut opt_io_vec_idx: Option<usize> = None;
+        {
+            let ring = &mut inner.ring;
+            ring.submit_and_wait(1)?;
+            let cq = &mut ring.completion();
+            while let Some(cqe) = cq.next() {
+                let result = cqe.result();
+                ensure!(
+                    result >= 0,
+                    LinuxIOError::IOUringCQError(result)
+                );
+                let c = unsafe { Rc::from_raw(cqe.user_data() as *const ReadCompletionWrapped) };
+                c.completion.complete();
+                opt_io_vec_idx = Some(c.io_vec_idx);
+            }
         }
+        //TODO: Not a fan at all, this relies too heavily on getting only one entry from ring.
+        // Ownership rules does not allow me to have the mutable ring
+        match opt_io_vec_idx {
+            Some(io_vec_idx) => {
+                inner.free_io_vec_in_use(io_vec_idx);
+            },
+            None => {}
+        }
+
         Ok(())
     }
 }
@@ -110,18 +173,23 @@ impl File for LinuxFile {
         trace!("pread(pos = {}, length = {})", pos, c.buf().len());
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let mut io = self.io.borrow_mut();
+
         let read_e = {
             let mut buf = c.buf_mut();
             let len = buf.len();
             let buf = buf.as_mut_ptr();
-            let ptr = Rc::into_raw(c.clone());
-            let iovec = io.get_iovec(buf, len);
+            let (iovec, io_vec_idx) = io.get_iovec(buf, len);
+            let cwrapped = Rc::new(ReadCompletionWrapped {
+                completion: c.clone(),
+                io_vec_idx: io_vec_idx,
+            });
+            let ptr = Rc::into_raw(cwrapped.clone());
             io_uring::opcode::Readv::new(fd, iovec, 1)
                 .offset(pos as u64)
                 .build()
                 .user_data(ptr as u64)
         };
-        let mut ring = &mut io.ring;
+        let ring = &mut io.ring;
         unsafe {
             ring.submission()
                 .push(&read_e)
@@ -140,14 +208,18 @@ impl File for LinuxFile {
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let write = {
             let buf = buffer.borrow();
-            let ptr = Rc::into_raw(c.clone());
-            let iovec = io.get_iovec(buf.as_ptr(), buf.len());
+            let (iovec, io_vec_idx) = io.get_iovec(buf.as_ptr(), buf.len());
+            let cwrapped = Rc::new(WriteCompletionWrapped {
+                completion: c.clone(),
+                io_vec_idx: io_vec_idx,
+            });
+            let ptr = Rc::into_raw(cwrapped.clone());
             io_uring::opcode::Writev::new(fd, iovec, 1)
                 .offset(pos as u64)
                 .build()
                 .user_data(ptr as u64)
         };
-        let mut ring = &mut io.ring;
+        let ring = &mut io.ring;
         unsafe {
             ring.submission()
                 .push(&write)
